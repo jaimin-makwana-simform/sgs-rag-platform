@@ -9,6 +9,7 @@ strategy later means adding one `Pipeline` subclass — nothing above it changes
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from ..search_index import Retrieved
@@ -41,3 +42,13 @@ class Pipeline(ABC):
 
         Used to label evaluation runs so every result is self-describing.
         """
+
+    def answer_stream(self, question: str) -> tuple[list[Retrieved], Iterator[str]]:
+        """Stream an answer as ``(sources, text-delta iterator)``.
+
+        Default implementation wraps the blocking ``answer()`` and yields the whole
+        text once — so non-streaming strategies (e.g. Foundry IQ) still satisfy the
+        interface. Streaming strategies override this to yield tokens as they arrive.
+        """
+        result = self.answer(question)
+        return result.sources, iter([result.text])

@@ -62,6 +62,23 @@ class Settings(BaseSettings):
             return ep
         return f"{ep}/api/projects/{self.foundry_project_name}"
 
+    # ---- Azure AI Speech (voice input/output) ----
+    # Reuses the AIServices resource (dev3) by default: leave the key blank to fall
+    # back to AZURE_OPENAI_API_KEY, and set the region the resource lives in.
+    speech_region: str = Field("eastus", alias="SPEECH_REGION")
+    speech_api_key: str = Field("", alias="SPEECH_API_KEY")
+    speech_voice: str = Field("en-US-AvaMultilingualNeural", alias="SPEECH_VOICE")
+
+    @property
+    def effective_speech_key(self) -> str:
+        """Speech key, falling back to the shared AIServices/OpenAI key."""
+        return self.speech_api_key or self.azure_openai_api_key
+
+    # ---- Voice streaming backend (FastAPI SSE service for concurrent TTS) ----
+    voice_backend_url: str = Field("http://localhost:8000", alias="VOICE_BACKEND_URL")
+    voice_backend_host: str = Field("localhost", alias="VOICE_BACKEND_HOST")
+    voice_backend_port: int = Field(8000, alias="VOICE_BACKEND_PORT")
+
     # ---- Pipeline mode ----
     # Which retrieval/answering strategy to use by default. The UI overrides this per
     # session. "custom" = local hybrid pipeline (tunable); "foundry_iq" = Foundry Agent.

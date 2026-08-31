@@ -114,6 +114,47 @@ agent identity, the evaluation harness) is shared.
 > — use the **Max questions** cap in the Evaluate tab for demos, or raise the
 > deployment capacity for full runs.
 
+## Voice: speak your question, hear the answer
+
+The **Ask** tab has an input toggle — **⌨️ Type** or **🎙️ Speak**. In Speak mode you record a
+question (`st.audio_input`), it's transcribed with **Azure AI Speech STT**, the **Custom RAG**
+pipeline **streams** the answer token-by-token (live on screen), and with **🔊 Speak answer** on,
+each sentence is synthesized (**Azure Speech TTS**) and played **gaplessly** via a small
+audio-queue component — so the answer is spoken as it comes together.
+
+- Speech reuses the existing **AIServices resource** (`hitl-agent-dev3-foundry`, eastus): leave
+  `SPEECH_API_KEY` blank to fall back to `AZURE_OPENAI_API_KEY`. Voice/region in `.env`
+  (`SPEECH_REGION`, `SPEECH_VOICE`).
+- Code: `src/speech.py` (`transcribe`, `synthesize_sentence`, `sentence_chunks`),
+  `src/audio_player.py` (gapless queue), `CustomRagPipeline.answer_stream()` (streaming), UI in
+  `app.py::_ask_tab`.
+- Notes: streaming is wired for **Custom RAG** (the Foundry path falls back to non-streaming);
+  first spoken word waits on gpt-5.1's reasoning phase (~5–7s, minimized via
+  `reasoning_effort="minimal"`), and the shared `gpt-5-1` 10K-TPM quota still applies.
+
+### Voice output modes: "Streaming (live)" vs "After generation"
+
+The 🔊 **Speak answer** control (Custom mode) offers two voice-output modes:
+
+- **Streaming (live)** — *concurrent* playback: audio begins after the **first sentence** and
+  plays gaplessly while later sentences are still generated. This is served by a small
+  **FastAPI backend** (`server.py`) that runs the answer once and streams
+  **sources → text → per-sentence audio** to the browser over **SSE** (`src/audio_player.py::render_voice_stream`).
+  Keys stay server-side. Requires the backend to be running.
+- **After generation** — the in-Streamlit fallback: text streams, then all sentences are
+  synthesized (in parallel) and played. No backend needed.
+
+**Run both together** with the launcher (starts the FastAPI backend + Streamlit, Ctrl-C stops both):
+
+```bash
+./run.sh
+```
+
+Or run them separately: `uv run uvicorn server:app --host localhost --port 8000` and
+`uv run streamlit run app.py`. Backend URL/host/port are configured via `VOICE_BACKEND_URL` /
+`VOICE_BACKEND_HOST` / `VOICE_BACKEND_PORT` in `.env`. The FastAPI `/voice/stream` endpoint is
+also the reusable backend a future non-Streamlit frontend (or the talking avatar) would call.
+
 ## Architecture decision: direct `azure-search-documents` SDK (not LangChain's `AzureSearch`)
 
 The retrieval layer talks to Azure AI Search through the **`azure-search-documents`
@@ -148,8 +189,12 @@ localized to `search_index.py` and `rag.py`; the same endpoint, key, and index s
 
 ```
 app.py               Streamlit UI (mode toggle, Ask + Evaluate tabs, upload, re-index)
+server.py            FastAPI SSE backend for "Streaming (live)" voice output
+run.sh               launcher: starts the voice backend + Streamlit together
 ingest.py            CLI to ingest the seed PDFs
 src/
+  speech.py          Azure Speech STT + TTS wrapper (transcribe, synthesize, sentences)
+  audio_player.py    browser audio components (gapless queue + SSE voice stream)
   config.py          Settings (pydantic-settings, from .env) incl. Foundry + eval
   pdf_loader.py      PyMuPDF text extraction
   chunker.py         token-based recursive chunking (tiktoken)

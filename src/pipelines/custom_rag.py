@@ -9,12 +9,20 @@ all user-tunable per session.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 from openai import AzureOpenAI
 
 from .. import search_index
 from ..config import Settings
 from ..embeddings import build_chat_client, build_client, embed_query
+from ..search_index import Retrieved
 from .base import Answer, Pipeline
+
+_REFUSAL = (
+    "I couldn't find anything relevant in the available SGS documents, so I can't "
+    "answer that. Try asking about the SGS policies or general-conditions documents."
+)
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant answering questions about SGS policy and "
@@ -77,48 +85,87 @@ class CustomRagPipeline(Pipeline):
             chunk_overlap if chunk_overlap is not None else settings.chunk_overlap
         )
 
-    def answer(self, question: str) -> Answer:
+    def _retrieve(self, question: str) -> tuple[list[Retrieved], str | None]:
+        """Retrieve + apply the relevance gate.
+
+        Returns ``(relevant_chunks, user_prompt)``. If nothing clears the reranker
+        threshold, returns ``([], None)`` so the caller can refuse without an LLM call.
+        """
         query_vector = embed_query(self.embed_client, self.settings, question)
         retrieved = search_index.hybrid_search(
             self.settings, question, query_vector, self.top_k
         )
-
-        # Relevance gate: keep only chunks whose semantic reranker score clears the
-        # threshold. For out-of-scope questions nothing clears it, so we skip the LLM
-        # call entirely and return no sources.
         relevant = [
             r for r in retrieved if r.reranker_score >= self.reranker_threshold
         ]
         if not relevant:
-            return Answer(
-                text=(
-                    "I couldn't find anything relevant in the available SGS documents, "
-                    "so I can't answer that. Try asking about the SGS policies or "
-                    "general-conditions documents."
-                ),
-                sources=[],
-            )
-
-        context = format_context(relevant)
+            return [], None
         user_prompt = (
-            f"Context:\n{context}\n\n"
+            f"Context:\n{format_context(relevant)}\n\n"
             f"Question: {question}\n\n"
             "Answer using only the context above, with inline [source p.PAGE] citations."
         )
+        return relevant, user_prompt
 
-        # GPT-5 family models require `max_completion_tokens` instead of `max_tokens`
-        # and only support the default temperature — so we don't send `temperature`.
-        # These params are also accepted by gpt-4.x models, so this works across
-        # model generations.
-        response = self.chat_client.chat.completions.create(
+    def _create(self, user_prompt: str, *, stream: bool):
+        """Chat completion call shared by answer() and answer_stream().
+
+        GPT-5 family models require `max_completion_tokens` (not `max_tokens`) and only
+        support the default temperature. `reasoning_effort="minimal"` shortens the
+        pre-content reasoning phase so the first token (and first spoken word) arrives
+        sooner; we fall back gracefully if the deployment rejects the param.
+        """
+        kwargs = dict(
             model=self.settings.azure_openai_chat_deployment,
             max_completion_tokens=self.settings.chat_max_tokens,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
+            stream=stream,
         )
+        try:
+            return self.chat_client.chat.completions.create(
+                reasoning_effort="minimal", **kwargs
+            )
+        except Exception:  # noqa: BLE001 - retry without reasoning_effort if unsupported
+            return self.chat_client.chat.completions.create(**kwargs)
+
+    def retrieve(self, question: str) -> list[Retrieved]:
+        """Return the relevant retrieved chunks only (no generation).
+
+        Cheap (embeddings + search, no LLM) — used to show citations alongside the
+        streaming-voice component, which renders in a fixed-height iframe.
+        """
+        relevant, _ = self._retrieve(question)
+        return relevant
+
+    def answer(self, question: str) -> Answer:
+        relevant, user_prompt = self._retrieve(question)
+        if user_prompt is None:
+            return Answer(text=_REFUSAL, sources=[])
+        response = self._create(user_prompt, stream=False)
         return Answer(text=response.choices[0].message.content, sources=relevant)
+
+    def answer_stream(self, question: str) -> tuple[list[Retrieved], Iterator[str]]:
+        """Stream the answer: sources are known up front, text deltas stream after.
+
+        Returns ``(sources, deltas)``. On refusal, sources is empty and the iterator
+        yields the single refusal message.
+        """
+        relevant, user_prompt = self._retrieve(question)
+        if user_prompt is None:
+            return [], iter([_REFUSAL])
+
+        def _deltas() -> Iterator[str]:
+            for chunk in self._create(user_prompt, stream=True):
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+
+        return relevant, _deltas()
 
     def describe_config(self) -> dict:
         return {

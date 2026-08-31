@@ -264,6 +264,23 @@ def save_report(settings: Settings, report: EvalReport, filename: str) -> Path:
     return path
 
 
+def load_cached_baseline(
+    settings: Settings, dataset_path: str | Path
+) -> EvalReport | None:
+    """Return the cached Foundry IQ baseline if it matches the dataset, else None.
+
+    A pure cache read — never calls the backend. Lets callers (e.g. the UI) decide
+    whether a baseline run is needed without triggering one.
+    """
+    baseline_path = _results_dir(settings) / BASELINE_FILENAME
+    if not baseline_path.exists():
+        return None
+    cached = EvalReport.from_json(json.loads(baseline_path.read_text()))
+    if cached.dataset_fingerprint == _fingerprint(dataset_path):
+        return cached
+    return None
+
+
 def get_or_compute_baseline(
     settings: Settings,
     dataset_path: str | Path,
@@ -277,12 +294,9 @@ def get_or_compute_baseline(
     The cache is keyed by the dataset fingerprint, so editing the dataset
     automatically invalidates a stale baseline.
     """
-    baseline_path = _results_dir(settings) / BASELINE_FILENAME
-    fingerprint = _fingerprint(dataset_path)
-
-    if baseline_path.exists() and not force:
-        cached = EvalReport.from_json(json.loads(baseline_path.read_text()))
-        if cached.dataset_fingerprint == fingerprint:
+    if not force:
+        cached = load_cached_baseline(settings, dataset_path)
+        if cached is not None:
             return cached
 
     pipeline = get_pipeline(settings, "foundry_iq")

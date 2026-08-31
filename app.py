@@ -20,13 +20,15 @@ from src.config import get_settings
 from src.embeddings import build_client
 from src.evaluation import (
     ALL_METRICS,
-    BASELINE_FILENAME,
     EvalReport,
     compare,
     get_or_compute_baseline,
+    load_cached_baseline,
     run_evaluation,
     save_report,
 )
+from src import speech
+from src.audio_player import render_audio_queue, render_voice_stream
 from src.pdf_loader import discover_pdfs
 from src.pipelines import MODE_LABELS, get_pipeline
 from src.rag import ingest_files
@@ -58,6 +60,25 @@ def _save_uploaded_files(files, custom_dir: Path) -> list[Path]:
     return saved
 
 
+def _reindex_all(settings) -> int:
+    """Re-chunk, re-embed and re-upload all seed + custom PDFs. Returns chunk count.
+
+    Used when chunk size/overlap change — those are ingest-time parameters, so the
+    index must be rebuilt with new chunks + embeddings for the change to take effect.
+    """
+    seed_pdfs = discover_pdfs(
+        [d for d in settings.docs_dirs_list if d != settings.custom_docs_dir], root=ROOT
+    )
+    custom_pdfs = discover_pdfs([settings.custom_docs_dir], root=ROOT)
+    total = 0
+    for group, source in ((seed_pdfs, "seed"), (custom_pdfs, "custom")):
+        if group:
+            total += ingest_files(
+                settings, group, doc_source=source, client=_embed_client(settings)
+            ).chunks_uploaded
+    return total
+
+
 def _sidebar(settings) -> tuple[str, dict]:
     """Render the sidebar; return (mode, custom_overrides)."""
     with st.sidebar:
@@ -74,28 +95,77 @@ def _sidebar(settings) -> tuple[str, dict]:
 
         overrides: dict = {}
         if mode == "custom":
-            st.subheader("Custom parameters")
-            overrides["top_k"] = st.slider(
-                "Top-K retrieved chunks", 1, 15, settings.top_k
-            )
-            overrides["reranker_threshold"] = st.slider(
-                "Reranker threshold (0-4)",
-                0.0,
-                4.0,
-                float(settings.reranker_threshold),
-                0.1,
-                help="Minimum semantic reranker score for a chunk to be used / answered.",
-            )
-            overrides["chunk_size"] = st.slider(
-                "Chunk size (tokens)", 128, 1024, settings.chunk_size, 32
-            )
-            overrides["chunk_overlap"] = st.slider(
-                "Chunk overlap (tokens)", 0, 256, settings.chunk_overlap, 16
-            )
-            st.caption(
-                "Top-K and threshold apply live. Chunk size/overlap only take effect "
-                "after re-indexing with these settings (button below)."
-            )
+            # Applied params (not the raw sliders) drive answering + evaluation. The
+            # sliders live inside a form, so dragging them does NOT rerun the app or
+            # hit the backend — nothing changes until "Submit" is pressed.
+            if "applied_params" not in st.session_state:
+                st.session_state.applied_params = {
+                    "top_k": settings.top_k,
+                    "reranker_threshold": float(settings.reranker_threshold),
+                    "chunk_size": settings.chunk_size,
+                    "chunk_overlap": settings.chunk_overlap,
+                }
+            if "indexed_chunking" not in st.session_state:
+                # The chunk config the current index was actually built with.
+                st.session_state.indexed_chunking = {
+                    "chunk_size": settings.chunk_size,
+                    "chunk_overlap": settings.chunk_overlap,
+                }
+            applied = st.session_state.applied_params
+
+            with st.form("custom_params"):
+                st.subheader("Custom parameters")
+                top_k = st.slider("Top-K retrieved chunks", 1, 15, applied["top_k"])
+                threshold = st.slider(
+                    "Reranker threshold (0-4)", 0.0, 4.0,
+                    float(applied["reranker_threshold"]), 0.1,
+                    help="Min semantic reranker score for a chunk to be used / answered.",
+                )
+                chunk_size = st.slider(
+                    "Chunk size (tokens)", 128, 1024, applied["chunk_size"], 32
+                )
+                chunk_overlap = st.slider(
+                    "Chunk overlap (tokens)", 0, 256, applied["chunk_overlap"], 16
+                )
+                st.caption(
+                    "Nothing is applied until you press Submit. Top-K / threshold "
+                    "apply with no re-index; changing chunk size / overlap triggers a "
+                    "re-index (re-chunk + re-embed) on Submit."
+                )
+                submitted = st.form_submit_button("Submit", type="primary")
+
+            if submitted:
+                need_reindex = (
+                    chunk_size != st.session_state.indexed_chunking["chunk_size"]
+                    or chunk_overlap != st.session_state.indexed_chunking["chunk_overlap"]
+                )
+                st.session_state.applied_params = {
+                    "top_k": top_k,
+                    "reranker_threshold": threshold,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap,
+                }
+                if need_reindex:
+                    settings.chunk_size = chunk_size
+                    settings.chunk_overlap = chunk_overlap
+                    with st.spinner(
+                        "Chunking changed — re-indexing (re-chunk + re-embed)..."
+                    ):
+                        total = _reindex_all(settings)
+                    st.session_state.indexed_chunking = {
+                        "chunk_size": chunk_size, "chunk_overlap": chunk_overlap,
+                    }
+                    st.success(
+                        f"Applied. Re-indexed {total} chunk(s) at chunk_size="
+                        f"{chunk_size}, overlap={chunk_overlap}. "
+                        f"Top-K={top_k}, threshold={threshold}."
+                    )
+                else:
+                    st.success(
+                        f"Applied Top-K={top_k}, threshold={threshold} "
+                        "(no re-index needed — embeddings unchanged)."
+                    )
+            overrides = st.session_state.applied_params
         else:
             st.caption(
                 f"Agent: `{settings.foundry_agent_name}`  \n"
@@ -126,26 +196,6 @@ def _sidebar(settings) -> tuple[str, dict]:
                 f"{result.chunks_uploaded} chunk(s)."
             )
 
-        if mode == "custom" and st.button("Re-index with these settings"):
-            # Apply the chunking overrides to the shared settings, then re-ingest.
-            settings.chunk_size = overrides["chunk_size"]
-            settings.chunk_overlap = overrides["chunk_overlap"]
-            seed_pdfs = discover_pdfs(
-                [d for d in settings.docs_dirs_list if d != settings.custom_docs_dir],
-                root=ROOT,
-            )
-            custom_pdfs = discover_pdfs([settings.custom_docs_dir], root=ROOT)
-            with st.spinner("Re-indexing all documents with new chunk settings..."):
-                total = 0
-                for group, source in ((seed_pdfs, "seed"), (custom_pdfs, "custom")):
-                    if group:
-                        total += ingest_files(
-                            settings, group, doc_source=source,
-                            client=_embed_client(settings),
-                        ).chunks_uploaded
-            st.success(f"Re-indexed {total} chunk(s) with chunk_size="
-                       f"{overrides['chunk_size']}, overlap={overrides['chunk_overlap']}.")
-
         st.divider()
         st.caption("🛡️ Guardrails: **Microsoft.DefaultV2** (enforced on gpt-5-1 — "
                    "applies to both modes and cannot be tuned away).")
@@ -153,37 +203,105 @@ def _sidebar(settings) -> tuple[str, dict]:
     return mode, overrides
 
 
-def _ask_tab(settings, mode: str, overrides: dict) -> None:
-    st.subheader(f"Ask — {MODE_LABELS[mode]}")
+def _render_sources(sources) -> None:
+    if not sources:
+        return
+    st.markdown("### Sources")
+    for i, src in enumerate(sources, 1):
+        label = (f"{i}. {src.source_file}"
+                 + (f" — p.{src.page}" if src.page else "")
+                 + (f" (reranker {src.reranker_score:.2f})" if src.reranker_score else ""))
+        with st.expander(label):
+            st.write(src.content)
+
+
+def _get_question(settings, input_mode: str) -> tuple[str | None, bool]:
+    """Return (question, ready_to_answer) for the selected input mode."""
+    if input_mode == "🎙️ Speak":
+        clip = st.audio_input("Record your question")
+        if clip is None:
+            return None, False
+        try:
+            with st.spinner("Transcribing…"):
+                question = speech.transcribe(settings, clip.getvalue())
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Transcription failed: {type(exc).__name__}: {exc}")
+            return None, False
+        if not question.strip():
+            st.warning("Didn't catch that — please record again.")
+            return None, False
+        st.info(f"📝 Transcript: {question}")
+        return question, True
+
     question = st.text_input(
         "Your question",
         placeholder="e.g. What does the SGS anti-corruption policy prohibit?",
     )
-    if st.button("Ask", type="primary") and question.strip():
-        result = None
-        error: Exception | None = None
-        with st.spinner("Retrieving and generating an answer..."):
-            try:
-                pipeline = get_pipeline(settings, mode, **overrides)
-                result = pipeline.answer(question.strip())
-            except Exception as exc:  # noqa: BLE001
-                error = exc
+    return question, bool(st.button("Ask", type="primary") and question.strip())
 
-        if error is not None:
-            st.error(f"Error: {type(error).__name__}: {error}")
-            return
 
+def _ask_tab(settings, mode: str, overrides: dict) -> None:
+    st.subheader(f"Ask — {MODE_LABELS[mode]}")
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        input_mode = st.radio("Input", ["⌨️ Type", "🎙️ Speak"], horizontal=True)
+    with c2:
+        # "Streaming (live)" needs the FastAPI backend + Custom pipeline; the other
+        # options work in any mode. "Text only" produces no audio.
+        voice_options = (
+            ["Streaming (live)", "After generation", "Text only"]
+            if mode == "custom"
+            else ["After generation", "Text only"]
+        )
+        voice_mode = st.selectbox("Voice output", voice_options)
+
+    question, ready = _get_question(settings, input_mode)
+    if not ready or not question:
+        return
+    question = question.strip()
+
+    # --- Concurrent streaming voice (c1): backend drives text + audio in the component;
+    #     citations are rendered natively (always visible, not clipped by the iframe). ---
+    if mode == "custom" and voice_mode == "Streaming (live)":
         st.markdown("### Answer")
-        st.write(result.text)
-        if result.sources:
-            st.markdown("### Sources")
-            for i, src in enumerate(result.sources, 1):
-                label = (f"{i}. {src.source_file}"
-                         + (f" — p.{src.page}" if src.page else "")
-                         + (f" (reranker {src.reranker_score:.2f})"
-                            if src.reranker_score else ""))
-                with st.expander(label):
-                    st.write(src.content)
+        render_voice_stream(question, settings.voice_backend_url, overrides=overrides)
+        st.caption(
+            "Streaming from the voice backend — audio plays as the answer generates. "
+            "If it says the backend isn't running, start it (or use `run.sh`)."
+        )
+        try:
+            sources = get_pipeline(settings, "custom", **overrides).retrieve(question)
+            _render_sources(sources)
+        except Exception as exc:  # noqa: BLE001 - citations are best-effort here
+            st.caption(f"(couldn't load citations: {type(exc).__name__})")
+        return
+
+    # --- Non-streaming path: stream text; optional spoken answer after generation (b) ---
+    try:
+        pipeline = get_pipeline(settings, mode, **overrides)
+        sources, deltas = pipeline.answer_stream(question)
+        st.markdown("### Answer")
+        full_text = st.write_stream(deltas)
+    except Exception as exc:  # noqa: BLE001
+        msg = f"Error: {type(exc).__name__}: {exc}"
+        if "429" in str(exc) or "rate_limit" in str(exc).lower():
+            msg += ("  \n\n_The gpt-5-1 deployment hit its rate limit — wait a moment "
+                    "and retry, or raise its capacity._")
+        st.error(msg)
+        return
+
+    # Voice output: synthesize each sentence and play them gaplessly ("Text only" skips this).
+    if voice_mode == "After generation" and isinstance(full_text, str) and full_text.strip():
+        try:
+            with st.spinner("Preparing audio…"):
+                sentences = list(speech.sentence_chunks([full_text]))
+                clips = speech.synthesize_many(settings, sentences)  # parallel
+            render_audio_queue(clips)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Voice output unavailable: {type(exc).__name__}: {exc}")
+
+    _render_sources(sources)
 
 
 def _metrics_table(reports: dict[str, EvalReport]) -> pd.DataFrame:
@@ -194,14 +312,27 @@ def _metrics_table(reports: dict[str, EvalReport]) -> pd.DataFrame:
 
 def _evaluate_tab(settings) -> None:
     st.subheader("Evaluate & compare vs the Foundry IQ baseline")
-    dataset_path = st.text_input("Ground-truth dataset (JSONL)", settings.eval_dataset_path)
-    if not Path(dataset_path).exists():
-        st.warning(
-            f"`{dataset_path}` not found. Generate it with "
-            "`python -m eval.generate_ground_truth`, or point to "
-            "`eval/seed_questions.jsonl`."
-        )
+    uploaded = st.file_uploader(
+        "Upload ground-truth dataset (JSONL)",
+        type=["jsonl"],
+        help=(
+            "One JSON object per line, e.g.: "
+            '{"question": "...", "ground_truth_answer": "...", '
+            '"relevant_docs": ["file.pdf"], "answerable": true}'
+        ),
+    )
+    if uploaded is None:
+        st.info("Upload a ground-truth `.jsonl` dataset to run an evaluation.")
         return
+
+    # Persist the upload so the (path-based) eval harness can read it. The baseline
+    # cache is keyed by a fingerprint of the file *contents*, so re-uploading the
+    # same dataset reuses the cached baseline; a different dataset recomputes it.
+    dataset_path = Path(settings.eval_results_dir) / "uploaded_dataset.jsonl"
+    dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset_path.write_bytes(uploaded.getvalue())
+    n_rows = sum(1 for line in uploaded.getvalue().decode("utf-8").splitlines() if line.strip())
+    st.caption(f"Loaded **{uploaded.name}** — {n_rows} question(s).")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -213,73 +344,83 @@ def _evaluate_tab(settings) -> None:
         )
     lim = None if limit == 0 else int(limit)
 
-    # --- Baseline (Default Foundry IQ), cached ---
-    st.markdown("#### 1. Default Foundry IQ baseline")
-    baseline_path = Path(settings.eval_results_dir) / BASELINE_FILENAME
-    cols = st.columns([1, 1])
-    force = cols[1].checkbox("Recompute baseline", value=False)
-    if cols[0].button("Compute / load baseline"):
+    # --- 1. Default Foundry IQ baseline: runs automatically on upload, cached ---
+    st.markdown("#### Default Foundry IQ baseline")
+    recompute = st.checkbox(
+        "Recompute baseline on next Custom evaluation",
+        value=False,
+        help=(
+            "When checked, clicking 'Evaluate Custom RAG' refreshes the Foundry IQ "
+            "baseline first. Toggling this alone does not call the backend."
+        ),
+    )
+
+    # Pure cache read (no backend). If missing for this dataset, run it now.
+    baseline = load_cached_baseline(settings, dataset_path)
+    if baseline is None:
         bar = st.progress(0.0, text="Running Foundry IQ baseline...")
         try:
             baseline = get_or_compute_baseline(
-                settings, dataset_path, force=force, limit=lim,
+                settings, dataset_path, force=False, limit=lim,
                 progress=lambda d, t: bar.progress(d / t, text=f"Baseline {d}/{t}"),
             )
-            st.session_state["baseline"] = baseline.to_json()
-            st.success(f"Baseline ready ({baseline.n_questions} questions).")
+            bar.empty()
+            st.success(f"Foundry IQ baseline ready ({baseline.n_questions} question(s)).")
         except Exception as exc:  # noqa: BLE001
+            bar.empty()
             st.error(f"Baseline failed: {type(exc).__name__}: {exc}")
-    elif baseline_path.exists() and "baseline" not in st.session_state:
-        st.session_state["baseline"] = __import__("json").loads(baseline_path.read_text())
-
-    baseline = (
-        EvalReport.from_json(st.session_state["baseline"])
-        if "baseline" in st.session_state else None
-    )
-    if baseline:
-        st.caption(f"Baseline config: `{baseline.config}`")
-        st.dataframe(_metrics_table({"Foundry IQ (baseline)": baseline}))
-
-    # --- Custom run + comparison ---
-    st.markdown("#### 2. Evaluate current Custom config")
-    st.caption("Set the Custom parameters in the sidebar, then run this.")
-    # Rebuild custom overrides from the sidebar sliders via session widgets.
-    overrides = {
-        "top_k": settings.top_k,
-        "reranker_threshold": settings.reranker_threshold,
-        "chunk_size": settings.chunk_size,
-        "chunk_overlap": settings.chunk_overlap,
-    }
-    if st.button("Run Custom evaluation", type="primary"):
-        if baseline is None:
-            st.warning("Compute the baseline first (step 1).")
             return
-        bar = st.progress(0.0, text="Running Custom evaluation...")
+
+    st.caption(f"Baseline config: `{baseline.config}`")
+    st.dataframe(_metrics_table({"Foundry IQ (baseline)": baseline}))
+
+    # --- 2. Custom RAG: the only checkbox-independent backend trigger ---
+    st.markdown("#### Evaluate Custom RAG")
+    st.caption("Uses the Custom parameters you submitted in the sidebar.")
+    overrides = st.session_state.get(
+        "applied_params",
+        {
+            "top_k": settings.top_k,
+            "reranker_threshold": settings.reranker_threshold,
+            "chunk_size": settings.chunk_size,
+            "chunk_overlap": settings.chunk_overlap,
+        },
+    )
+    if st.button("Evaluate Custom RAG", type="primary"):
         try:
+            if recompute:
+                bar_b = st.progress(0.0, text="Recomputing Foundry IQ baseline...")
+                baseline = get_or_compute_baseline(
+                    settings, dataset_path, force=True, limit=lim,
+                    progress=lambda d, t: bar_b.progress(d / t, text=f"Baseline {d}/{t}"),
+                )
+                bar_b.empty()
+            bar = st.progress(0.0, text="Running Custom evaluation...")
             pipeline = get_pipeline(settings, "custom", **overrides)
             custom = run_evaluation(
                 pipeline, dataset_path, settings,
                 metrics=tuple(metrics), limit=lim,
                 progress=lambda d, t: bar.progress(d / t, text=f"Custom {d}/{t}"),
             )
+            bar.empty()
             save_report(settings, custom, f"custom_{int(custom.timestamp)}.json")
             st.session_state["custom"] = custom.to_json()
         except Exception as exc:  # noqa: BLE001
             st.error(f"Custom eval failed: {type(exc).__name__}: {exc}")
             return
 
-    if "custom" in st.session_state and baseline is not None:
+    # --- 3. Comparison (only when the Custom run matches the current dataset) ---
+    if "custom" in st.session_state:
         custom = EvalReport.from_json(st.session_state["custom"])
-        cmp = compare(baseline, custom)
-        st.markdown("#### 3. Comparison")
-        st.info(f"**Verdict: {cmp.verdict}**")
-        table = _metrics_table(
-            {"Foundry IQ (baseline)": baseline, "Custom": custom}
-        )
-        table.loc["— winner —"] = [cmp.winners.get(m, "n/a") for m in ALL_METRICS]
-        table["Δ (custom−base)"] = pd.Series(cmp.deltas)
-        st.dataframe(table)
-        st.caption(f"Custom config: `{custom.config}`")
+        if custom.dataset_fingerprint == baseline.dataset_fingerprint:
+            cmp = compare(baseline, custom)
+            st.markdown("#### Comparison")
+            st.info(f"**Verdict: {cmp.verdict}**")
+            table = _metrics_table({"Foundry IQ (baseline)": baseline, "Custom": custom})
+            table["Δ (custom−base)"] = pd.Series(cmp.deltas)
+            table["winner"] = pd.Series(cmp.winners)
+            st.dataframe(table)
+            st.caption(f"Custom config: `{custom.config}`")
 
 
 def main() -> None:
