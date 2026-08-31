@@ -1,0 +1,32 @@
+[project]
+name = "sgs-rag-poc"
+version = "0.1.0"
+description = "RAG chatbot POC over SGS policy / general-conditions PDFs (Streamlit + Azure AI Search + Azure OpenAI)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.38",
+    "azure-search-documents>=11.5.2",
+    "azure-identity>=1.17",
+    "azure-ai-projects>=2.0",
+    "azure-ai-evaluation>=1.0",
+    "openai>=1.40",
+    "pymupdf>=1.24",
+    "tiktoken>=0.7",
+    "langchain-text-splitters>=0.3",
+    "pydantic-settings>=2.4",
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+]
+
+[tool.uv]
+# This is an application, not a distributable library — don't build/install the
+# project itself; just manage its dependencies in the environment.
+package = false
+
+[tool.ruff]
+line-length = 100

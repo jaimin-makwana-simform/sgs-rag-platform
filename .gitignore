@@ -1,0 +1,11 @@
+.env
+.env.generated
+.env.local
+__pycache__/
+*.pyc
+.venv/
+venv/
+custom_docs/*
+!custom_docs/.gitkeep
+eval/results/
+eval/ground_truth.jsonl

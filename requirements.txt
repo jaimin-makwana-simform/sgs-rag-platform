@@ -1,0 +1,11 @@
+streamlit>=1.38
+azure-search-documents>=11.5.2
+azure-identity>=1.17
+azure-ai-projects>=2.0
+azure-ai-evaluation>=1.0
+openai>=1.40
+pymupdf>=1.24
+tiktoken>=0.7
+langchain-text-splitters>=0.3
+pydantic-settings>=2.4
+python-dotenv>=1.0

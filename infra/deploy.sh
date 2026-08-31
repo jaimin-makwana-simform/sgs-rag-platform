@@ -1,0 +1,135 @@
+#!/bin/bash
+set -euo pipefail
+
+# Provisions Azure AI Search + Azure OpenAI (chat + embedding deployments) for the
+# SGS RAG POC, then writes the values the local app needs into ../.env.
+#
+# Deploys INTO AN EXISTING resource group — this account has Contributor on
+# specific resource groups, not the whole subscription, so it can't create new
+# ones. The RG must already exist; the script won't try to create it.
+#
+# Override any of these via environment variables before running, e.g.:
+#   RESOURCE_GROUP=AI-CoE-rg LOCATION=eastus ./infra/deploy.sh
+
+# ── Config ───────────────────────────────────────────────────────────────────
+SUBSCRIPTION="${SUBSCRIPTION:-}"                 # optional; uses current if empty
+RESOURCE_GROUP="${RESOURCE_GROUP:-AI-CoE-rg}"    # must already exist
+ENV_NAME="${ENV_NAME:-sgs-rag}"                  # prefix for resource names
+LOCATION="${LOCATION:-}"                          # empty => use the RG's own region
+DEPLOYMENT_NAME="sgs-rag-infra"
+API_VERSION="${AZURE_OPENAI_API_VERSION:-2024-10-21}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ── Step 1: Subscription ─────────────────────────────────────────────────────
+if [[ -n "$SUBSCRIPTION" ]]; then
+  echo ">>> Setting subscription to '$SUBSCRIPTION'..."
+  az account set --subscription "$SUBSCRIPTION"
+fi
+echo "    Active subscription: $(az account show --query name -o tsv)"
+
+# ── Step 2: Resource group (must already exist) ──────────────────────────────
+echo ">>> Checking resource group '$RESOURCE_GROUP'..."
+if ! az group show --name "$RESOURCE_GROUP" -o none 2>/dev/null; then
+  echo "!! Resource group '$RESOURCE_GROUP' not found (or you lack access to it)."
+  echo "   This account can't create subscription-level resource groups, so point"
+  echo "   RESOURCE_GROUP at one you already have Contributor on. List them with:"
+  echo "     az group list --query \"[].name\" -o tsv"
+  echo "   Then re-run, e.g.:  RESOURCE_GROUP=AI-CoE-rg ./infra/deploy.sh"
+  exit 1
+fi
+# Deploy resources into the RG's own region unless LOCATION was overridden.
+if [[ -z "$LOCATION" ]]; then
+  LOCATION="$(az group show --name "$RESOURCE_GROUP" --query location -o tsv)"
+fi
+echo "    Using existing resource group '$RESOURCE_GROUP' (region: $LOCATION)."
+
+# ── Step 3: Validate Bicep ───────────────────────────────────────────────────
+echo ">>> Compiling + linting Bicep..."
+az bicep build --file "$SCRIPT_DIR/main.bicep"
+
+echo ">>> Server-side validation (no resources created)..."
+az deployment group validate \
+  --resource-group "$RESOURCE_GROUP" \
+  --template-file "$SCRIPT_DIR/main.bicep" \
+  --parameters environmentName="$ENV_NAME" location="$LOCATION" \
+  --output none && echo "    Validation passed."
+
+# ── Step 4: What-if preview ──────────────────────────────────────────────────
+# NOTE: We always use INCREMENTAL mode (never Complete). Incremental only
+# creates/updates the resources declared in this template and leaves every other
+# resource in the shared '$RESOURCE_GROUP' untouched. The what-if below should
+# therefore only ever show "+ Create" for the two new project resources.
+echo ""
+echo ">>> What-if preview (incremental — other resources in the RG are untouched)..."
+az deployment group what-if \
+  --resource-group "$RESOURCE_GROUP" \
+  --mode Incremental \
+  --template-file "$SCRIPT_DIR/main.bicep" \
+  --parameters environmentName="$ENV_NAME" location="$LOCATION"
+
+# ── Step 5: Confirm + deploy ─────────────────────────────────────────────────
+echo ""
+read -rp ">>> Proceed with deployment? [y/N] " confirm
+if [[ ! "${confirm:-N}" =~ ^[Yy]$ ]]; then
+  echo "Cancelled."
+  exit 0
+fi
+
+echo ">>> Deploying (incremental; a few minutes)..."
+az deployment group create \
+  --name "$DEPLOYMENT_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --mode Incremental \
+  --template-file "$SCRIPT_DIR/main.bicep" \
+  --parameters environmentName="$ENV_NAME" location="$LOCATION" \
+  --output none
+echo "    Deployment complete."
+
+# ── Step 6: Read outputs + fetch keys ────────────────────────────────────────
+out() { az deployment group show -g "$RESOURCE_GROUP" -n "$DEPLOYMENT_NAME" \
+          --query "properties.outputs.$1.value" -o tsv; }
+
+OPENAI_ENDPOINT="$(out AZURE_OPENAI_ENDPOINT)"
+OPENAI_NAME="$(out AZURE_OPENAI_ACCOUNT_NAME)"
+CHAT_DEPLOY="$(out AZURE_OPENAI_CHAT_DEPLOYMENT)"
+EMBED_DEPLOY="$(out AZURE_OPENAI_EMBEDDING_DEPLOYMENT)"
+SEARCH_ENDPOINT="$(out AZURE_SEARCH_ENDPOINT)"
+SEARCH_NAME="$(out AZURE_SEARCH_SERVICE_NAME)"
+INDEX_NAME="$(out AZURE_SEARCH_INDEX_NAME)"
+
+echo ">>> Fetching keys..."
+OPENAI_KEY="$(az cognitiveservices account keys list -n "$OPENAI_NAME" -g "$RESOURCE_GROUP" --query key1 -o tsv)"
+SEARCH_KEY="$(az search admin-key show --service-name "$SEARCH_NAME" -g "$RESOURCE_GROUP" --query primaryKey -o tsv)"
+
+# ── Step 7: Write .env ───────────────────────────────────────────────────────
+ENV_BODY="# Generated by infra/deploy.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+AZURE_SEARCH_ENDPOINT=$SEARCH_ENDPOINT
+AZURE_SEARCH_API_KEY=$SEARCH_KEY
+AZURE_SEARCH_INDEX_NAME=$INDEX_NAME
+
+AZURE_OPENAI_ENDPOINT=$OPENAI_ENDPOINT
+AZURE_OPENAI_API_KEY=$OPENAI_KEY
+AZURE_OPENAI_API_VERSION=$API_VERSION
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=$EMBED_DEPLOY
+EMBEDDING_DIMENSIONS=1536
+AZURE_OPENAI_CHAT_DEPLOYMENT=$CHAT_DEPLOY
+"
+
+TARGET="$PROJECT_ROOT/.env"
+if [[ -f "$TARGET" ]]; then
+  TARGET="$PROJECT_ROOT/.env.generated"
+  echo ""
+  echo ">>> .env already exists — writing to .env.generated instead (review, then merge)."
+fi
+printf '%s' "$ENV_BODY" > "$TARGET"
+
+echo ""
+echo ">>> Done. Values written to: $TARGET"
+echo "    Azure OpenAI : $OPENAI_ENDPOINT  (chat=$CHAT_DEPLOY, embed=$EMBED_DEPLOY)"
+echo "    Azure Search : $SEARCH_ENDPOINT  (index=$INDEX_NAME)"
+echo ""
+echo "Next:"
+echo "  uv run python ingest.py      # create index + ingest the SGS PDFs"
+echo "  uv run streamlit run app.py  # launch the chatbot"
