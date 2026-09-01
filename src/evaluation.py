@@ -12,6 +12,7 @@ and an overall verdict (which config wins on most primary metrics).
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import time
@@ -19,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 
+import openai
 from azure.ai.evaluation import (
     AzureOpenAIModelConfiguration,
     F1ScoreEvaluator,
@@ -99,34 +101,84 @@ def _model_config(settings: Settings) -> AzureOpenAIModelConfiguration:
     )
 
 
+def _is_rate_limit(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, openai.RateLimitError) or "429" in text or "rate_limit" in text
+
+
+def _with_retry(fn: Callable, *, retries: int, base_wait: float, what: str):
+    """Call ``fn`` with linear backoff on rate-limit (429) errors.
+
+    Tight quotas (e.g. gpt-5-1's 10K TPM) make bursts of judge/answer calls 429;
+    waiting lets the per-minute budget refill instead of aborting the whole run.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_rate_limit(exc) or attempt == retries:
+                raise
+            wait = min(60.0, base_wait * (attempt + 1))
+            print(f"  rate-limited on {what}; retry {attempt + 1}/{retries} in {wait:.0f}s")
+            time.sleep(wait)
+
+
+def _apply_judge_token_cap(settings: Settings) -> None:
+    """Lower the eval SDK's oversized reasoning-model completion budget (60000) so a
+    single judge call fits within tight per-minute quotas. Best-effort; SDK-internal."""
+    try:
+        from azure.ai.evaluation._legacy.prompty import _prompty as _eval_prompty
+
+        _eval_prompty.DEFAULT_MAX_COMPLETION_TOKENS_REASONING_MODELS = (
+            settings.eval_judge_max_completion_tokens
+        )
+    except Exception:  # noqa: BLE001, S110 - best-effort; use SDK default if it moves
+        pass
+
+
+def _is_reasoning_model(deployment: str) -> bool:
+    """Whether the judge deployment is a reasoning model (gpt-5 / o-series).
+
+    Those models' chat API rejects ``max_tokens`` (needs ``max_completion_tokens``)
+    and ``temperature``/``top_p`` — the eval SDK adapts its request only when the
+    evaluator is created with ``is_reasoning_model=True``, so we must detect and flag
+    it or every LLM-judged metric fails with a 400 and scores come back ``None``.
+    """
+    name = deployment.lower()
+    return name.startswith(("o1", "o3", "o4")) or "gpt-5" in name
+
+
 def _build_evaluators(
     settings: Settings, metrics: tuple[str, ...]
 ) -> dict[str, tuple[object, Callable[[dict, Answer, str], dict], str]]:
     """Return metric -> (evaluator, input_builder(row, answer, context), result_key)."""
     mc = _model_config(settings)
+    reasoning = _is_reasoning_model(settings.azure_openai_chat_deployment)
+    if reasoning:
+        _apply_judge_token_cap(settings)
     registry: dict[str, tuple[object, Callable, str]] = {}
 
     if "groundedness" in metrics:
         registry["groundedness"] = (
-            GroundednessEvaluator(mc),
+            GroundednessEvaluator(mc, is_reasoning_model=reasoning),
             lambda row, ans, ctx: {"query": row["question"], "response": ans.text, "context": ctx},
             "groundedness",
         )
     if "relevance" in metrics:
         registry["relevance"] = (
-            RelevanceEvaluator(mc),
+            RelevanceEvaluator(mc, is_reasoning_model=reasoning),
             lambda row, ans, ctx: {"query": row["question"], "response": ans.text},
             "relevance",
         )
     if "retrieval" in metrics:
         registry["retrieval"] = (
-            RetrievalEvaluator(mc),
+            RetrievalEvaluator(mc, is_reasoning_model=reasoning),
             lambda row, ans, ctx: {"query": row["question"], "context": ctx},
             "retrieval",
         )
     if "response_completeness" in metrics:
         registry["response_completeness"] = (
-            ResponseCompletenessEvaluator(mc),
+            ResponseCompletenessEvaluator(mc, is_reasoning_model=reasoning),
             lambda row, ans, ctx: {
                 "response": ans.text,
                 "ground_truth": row.get("ground_truth_answer", ""),
@@ -194,16 +246,23 @@ def run_evaluation(
     llm_metrics = tuple(m for m in metrics if m in PRIMARY_METRICS or m == "f1")
     evaluators = _build_evaluators(settings, llm_metrics)
 
+    retry = {"retries": settings.eval_retry_max, "base_wait": settings.eval_retry_wait}
+
     per_row: list[dict] = []
     for i, row in enumerate(rows):
         question = row["question"]
-        answer = pipeline.answer(question)
+        answer = _with_retry(
+            functools.partial(pipeline.answer, question), what="answer", **retry
+        )
         context = "\n\n".join(s.content for s in answer.sources)
 
         scores: dict[str, float | None] = {}
         for metric, (evaluator, build_inputs, result_key) in evaluators.items():
             try:
-                result = evaluator(**build_inputs(row, answer, context))
+                result = _with_retry(
+                    functools.partial(evaluator, **build_inputs(row, answer, context)),
+                    what=metric, **retry,
+                )
                 scores[metric] = _extract_score(result, result_key)
             except Exception as exc:  # noqa: BLE001 - one metric failing shouldn't abort
                 scores[metric] = None

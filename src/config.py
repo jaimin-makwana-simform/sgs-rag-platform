@@ -74,6 +74,15 @@ class Settings(BaseSettings):
         """Speech key, falling back to the shared AIServices/OpenAI key."""
         return self.speech_api_key or self.azure_openai_api_key
 
+    # ---- Agent avatar (Azure real-time TTS Avatar) ----
+    # Opt-in / default off: the real-time avatar bills per minute, so the UI only
+    # offers it when enabled. Character/style are the standard prebuilt avatar; the
+    # avatar's voice reuses `speech_voice`. Region reuses `speech_region` (must be
+    # an avatar-supported region, e.g. eastus). See real-time avatar docs.
+    avatar_enabled: bool = Field(False, alias="AVATAR_ENABLED")
+    avatar_character: str = Field("lisa", alias="AVATAR_CHARACTER")
+    avatar_style: str = Field("casual-sitting", alias="AVATAR_STYLE")
+
     # ---- Voice streaming backend (FastAPI SSE service for concurrent TTS) ----
     voice_backend_url: str = Field("http://localhost:8000", alias="VOICE_BACKEND_URL")
     voice_backend_host: str = Field("localhost", alias="VOICE_BACKEND_HOST")
@@ -87,6 +96,15 @@ class Settings(BaseSettings):
     # ---- Evaluation ----
     eval_dataset_path: str = Field("eval/ground_truth.jsonl", alias="EVAL_DATASET_PATH")
     eval_results_dir: str = Field("eval/results", alias="EVAL_RESULTS_DIR")
+    # The eval SDK asks reasoning-model judges for up to 60000 completion tokens, which
+    # blows past tight per-minute quotas (e.g. gpt-5-1's 10K TPM) and triggers 429s. Cap
+    # it to a budget that still fits a scoring judgement. Also retry on 429 with backoff
+    # so a transient rate-limit doesn't abort the whole evaluation.
+    eval_judge_max_completion_tokens: int = Field(
+        8000, alias="EVAL_JUDGE_MAX_COMPLETION_TOKENS"
+    )
+    eval_retry_max: int = Field(5, alias="EVAL_RETRY_MAX")
+    eval_retry_wait: float = Field(15.0, alias="EVAL_RETRY_WAIT")
 
     # Optional: run the CHAT model on a DIFFERENT Azure OpenAI resource than the
     # embeddings. Leave blank to use the same resource as above (the portable,

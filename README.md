@@ -155,6 +155,31 @@ Or run them separately: `uv run uvicorn server:app --host localhost --port 8000`
 `VOICE_BACKEND_HOST` / `VOICE_BACKEND_PORT` in `.env`. The FastAPI `/voice/stream` endpoint is
 also the reusable backend a future non-Streamlit frontend (or the talking avatar) would call.
 
+### Agent avatar (Azure real-time TTS Avatar)
+
+An opt-in **talking-head avatar** speaks the answer using **Azure real-time TTS Avatar**
+(a photorealistic standard avatar that lip-syncs over WebRTC). It reuses the **same voice
+input** (record → STT → RAG) and the same `/voice/stream` answer — only the *speech output*
+is handled by the avatar, which synthesizes its own voice + video from the answer text.
+
+- **Enable it:** set `AVATAR_ENABLED=true` in `.env`. It's **off by default** because the
+  real-time avatar **bills per minute**. Character/style are configurable
+  (`AVATAR_CHARACTER=lisa`, `AVATAR_STYLE=casual-sitting`); the avatar's voice reuses
+  `SPEECH_VOICE`, and the session reuses `SPEECH_REGION` + the Speech key.
+- **Region:** `SPEECH_REGION` must support real-time avatar (`eastus`, `eastus2`, `westus2`,
+  `westeurope`, `swedencentral`, `centralindia`, `southcentralus`, `southeastasia`,
+  `italynorth`, `northeurope`, `francecentral`).
+- **Use it:** in **Custom** mode pick **Voice output → 🧑 Avatar**, ask (type or 🎙️ speak),
+  then click **Connect avatar** in the embedded panel. Needs the backend running (`run.sh`).
+- **How it's wired:** the backend serves the avatar client at its own origin
+  (`GET /avatar`) plus `GET /avatar/token` (mints the WebRTC ICE relay creds + a short-lived
+  Speech auth token — the raw key never reaches the browser). The Streamlit app embeds
+  `/avatar` via an iframe; the page opens `/voice/stream?...&audio=off` (text-only) and calls
+  `avatarSynthesizer.speakTextAsync()` per sentence. Client code: `static/avatar/`.
+- **Cost hygiene:** the avatar session closes on **Disconnect** / tab close, and auto-closes
+  after 5 min idle / 30 min max (Azure limits). Keeping it opt-in/default-off is the main
+  cost lever.
+
 ## Architecture decision: direct `azure-search-documents` SDK (not LangChain's `AzureSearch`)
 
 The retrieval layer talks to Azure AI Search through the **`azure-search-documents`
@@ -189,7 +214,8 @@ localized to `search_index.py` and `rag.py`; the same endpoint, key, and index s
 
 ```
 app.py               Streamlit UI (mode toggle, Ask + Evaluate tabs, upload, re-index)
-server.py            FastAPI SSE backend for "Streaming (live)" voice output
+server.py            FastAPI backend: "Streaming (live)" voice + avatar page/token endpoints
+static/avatar/       agent-avatar client (WebRTC + Azure real-time TTS Avatar SDK)
 run.sh               launcher: starts the voice backend + Streamlit together
 ingest.py            CLI to ingest the seed PDFs
 src/

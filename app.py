@@ -13,9 +13,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
+from src import speech
+from src.audio_player import render_audio_queue, render_voice_stream
 from src.config import get_settings
 from src.embeddings import build_client
 from src.evaluation import (
@@ -27,8 +31,6 @@ from src.evaluation import (
     run_evaluation,
     save_report,
 )
-from src import speech
-from src.audio_player import render_audio_queue, render_voice_stream
 from src.pdf_loader import discover_pdfs
 from src.pipelines import MODE_LABELS, get_pipeline
 from src.rag import ingest_files
@@ -215,6 +217,48 @@ def _render_sources(sources) -> None:
             st.write(src.content)
 
 
+def _render_avatar(url: str, *, height: int = 620) -> None:
+    """Embed the backend avatar page in an iframe granted autoplay permission.
+
+    Uses ``components.html`` (rather than ``components.iframe``) so we can set the
+    ``allow`` attribute — delegating autoplay to the cross-origin avatar page so its
+    WebRTC video/audio start without a manual click. The ``url`` is kept **constant**
+    (no per-question query string) so Streamlit reruns don't reload the iframe and the
+    avatar's WebRTC session persists — questions are delivered out-of-band (see below).
+    """
+    safe = url.replace('"', "&quot;")
+    components.html(
+        f'<iframe src="{safe}" allow="autoplay; camera; microphone; fullscreen" '
+        f'referrerpolicy="no-referrer" '
+        f'style="width:100%;height:{height - 8}px;border:0;border-radius:12px"></iframe>',
+        height=height,
+    )
+
+
+def _post_avatar_question(settings, question: str, overrides: dict) -> None:
+    """Publish a question to the connected avatar via the backend channel.
+
+    Guarded by session state so it fires once per new question (not on every rerun),
+    which keeps the persistent avatar from re-speaking the same answer.
+    """
+    payload = {
+        "q": question,
+        "top_k": overrides.get("top_k"),
+        "reranker_threshold": overrides.get("reranker_threshold"),
+    }
+    if st.session_state.get("_avatar_last_ask") == payload:
+        return
+    try:
+        httpx.post(
+            f"{settings.voice_backend_url.rstrip('/')}/avatar/ask",
+            json=payload,
+            timeout=5,
+        ).raise_for_status()
+        st.session_state["_avatar_last_ask"] = payload
+    except Exception as exc:  # noqa: BLE001 - non-fatal; avatar just won't speak this turn
+        st.caption(f"(couldn't send the question to the avatar: {type(exc).__name__})")
+
+
 def _get_question(settings, input_mode: str) -> tuple[str | None, bool]:
     """Return (question, ready_to_answer) for the selected input mode."""
     if input_mode == "🎙️ Speak":
@@ -247,14 +291,49 @@ def _ask_tab(settings, mode: str, overrides: dict) -> None:
     with c1:
         input_mode = st.radio("Input", ["⌨️ Type", "🎙️ Speak"], horizontal=True)
     with c2:
-        # "Streaming (live)" needs the FastAPI backend + Custom pipeline; the other
-        # options work in any mode. "Text only" produces no audio.
+        # "Streaming (live)" and "🧑 Avatar" need the FastAPI backend + Custom pipeline;
+        # the other options work in any mode. "Text only" produces no audio. The avatar
+        # is opt-in (billed per minute) and only offered when AVATAR_ENABLED is set.
         voice_options = (
             ["Streaming (live)", "After generation", "Text only"]
             if mode == "custom"
             else ["After generation", "Text only"]
         )
+        if mode == "custom" and settings.avatar_enabled:
+            voice_options.insert(1, "🧑 Avatar")
         voice_mode = st.selectbox("Voice output", voice_options)
+
+    # --- Agent avatar: the FastAPI-served avatar page (own origin) speaks the answer
+    #     via Azure real-time TTS Avatar over WebRTC. Reuses the same STT input + RAG.
+    #     The iframe renders in a FIXED slot with a CONSTANT url and auto-connects once;
+    #     each question is pushed over the backend channel (POST /avatar/ask), so the
+    #     WebRTC session persists across reruns — no reconnect between questions. ---
+    if voice_mode == "🧑 Avatar":
+        # Reserve the INPUT area first (question box / recorder stay on top), then place
+        # the avatar in a slot below it. Because both are fixed containers, the transcript
+        # (st.info) grows *inside* the input slot without shifting the avatar's position —
+        # so the iframe isn't remounted on rerun and the WebRTC session persists.
+        input_slot = st.container()
+        st.markdown("### Agent avatar")
+        avatar_slot = st.container()
+        with avatar_slot:
+            _render_avatar(f"{settings.voice_backend_url.rstrip('/')}/avatar")
+            st.caption(
+                "The avatar connects automatically and speaks each answer. "
+                "Needs the voice backend running (use `run.sh`)."
+            )
+
+        with input_slot:
+            question, ready = _get_question(settings, input_mode)
+        if ready and question and question.strip():
+            q = question.strip()
+            _post_avatar_question(settings, q, overrides)
+            try:
+                sources = get_pipeline(settings, "custom", **overrides).retrieve(q)
+                _render_sources(sources)
+            except Exception as exc:  # noqa: BLE001 - citations are best-effort here
+                st.caption(f"(couldn't load citations: {type(exc).__name__})")
+        return
 
     question, ready = _get_question(settings, input_mode)
     if not ready or not question:
@@ -334,49 +413,26 @@ def _evaluate_tab(settings) -> None:
     n_rows = sum(1 for line in uploaded.getvalue().decode("utf-8").splitlines() if line.strip())
     st.caption(f"Loaded **{uploaded.name}** — {n_rows} question(s).")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        metrics = st.multiselect("Metrics", list(ALL_METRICS), default=list(ALL_METRICS))
-    with col2:
-        limit = st.number_input(
-            "Max questions (0 = all)", min_value=0, value=5,
-            help="Cap questions to stay within gpt-5.1 quota during demos.",
-        )
-    lim = None if limit == 0 else int(limit)
-
-    # --- 1. Default Foundry IQ baseline: runs automatically on upload, cached ---
-    st.markdown("#### Default Foundry IQ baseline")
-    recompute = st.checkbox(
-        "Recompute baseline on next Custom evaluation",
-        value=False,
-        help=(
-            "When checked, clicking 'Evaluate Custom RAG' refreshes the Foundry IQ "
-            "baseline first. Toggling this alone does not call the backend."
-        ),
-    )
-
-    # Pure cache read (no backend). If missing for this dataset, run it now.
-    baseline = load_cached_baseline(settings, dataset_path)
-    if baseline is None:
-        bar = st.progress(0.0, text="Running Foundry IQ baseline...")
-        try:
-            baseline = get_or_compute_baseline(
-                settings, dataset_path, force=False, limit=lim,
-                progress=lambda d, t: bar.progress(d / t, text=f"Baseline {d}/{t}"),
+    # All eval inputs live in a FORM: changing metrics / max questions / recompute does
+    # NOT rerun the page or hit the backend — nothing runs until Submit. On submit we
+    # compute the Foundry IQ baseline (cached) and the Custom RAG run, then compare.
+    with st.form("eval_params"):
+        col1, col2 = st.columns(2)
+        with col1:
+            metrics = st.multiselect("Metrics", list(ALL_METRICS), default=list(ALL_METRICS))
+        with col2:
+            limit = st.number_input(
+                "Max questions (0 = all)", min_value=0, value=5,
+                help="Cap questions to stay within gpt-5.1 quota during demos.",
             )
-            bar.empty()
-            st.success(f"Foundry IQ baseline ready ({baseline.n_questions} question(s)).")
-        except Exception as exc:  # noqa: BLE001
-            bar.empty()
-            st.error(f"Baseline failed: {type(exc).__name__}: {exc}")
-            return
+        recompute = st.checkbox(
+            "Recompute Foundry IQ baseline",
+            value=False,
+            help="Force-refresh the cached baseline on this Submit (otherwise it's reused).",
+        )
+        submitted = st.form_submit_button("Submit — run evaluation", type="primary")
 
-    st.caption(f"Baseline config: `{baseline.config}`")
-    st.dataframe(_metrics_table({"Foundry IQ (baseline)": baseline}))
-
-    # --- 2. Custom RAG: the only checkbox-independent backend trigger ---
-    st.markdown("#### Evaluate Custom RAG")
-    st.caption("Uses the Custom parameters you submitted in the sidebar.")
+    lim = None if limit == 0 else int(limit)
     overrides = st.session_state.get(
         "applied_params",
         {
@@ -386,35 +442,55 @@ def _evaluate_tab(settings) -> None:
             "chunk_overlap": settings.chunk_overlap,
         },
     )
-    if st.button("Evaluate Custom RAG", type="primary"):
-        try:
-            if recompute:
-                bar_b = st.progress(0.0, text="Recomputing Foundry IQ baseline...")
-                baseline = get_or_compute_baseline(
-                    settings, dataset_path, force=True, limit=lim,
-                    progress=lambda d, t: bar_b.progress(d / t, text=f"Baseline {d}/{t}"),
-                )
-                bar_b.empty()
-            bar = st.progress(0.0, text="Running Custom evaluation...")
-            pipeline = get_pipeline(settings, "custom", **overrides)
-            custom = run_evaluation(
-                pipeline, dataset_path, settings,
-                metrics=tuple(metrics), limit=lim,
-                progress=lambda d, t: bar.progress(d / t, text=f"Custom {d}/{t}"),
-            )
-            bar.empty()
-            save_report(settings, custom, f"custom_{int(custom.timestamp)}.json")
-            st.session_state["custom"] = custom.to_json()
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Custom eval failed: {type(exc).__name__}: {exc}")
-            return
 
-    # --- 3. Comparison (only when the Custom run matches the current dataset) ---
+    # Backend work happens ONLY on Submit — Custom uses the sidebar's applied params.
+    if submitted:
+        if not metrics:
+            st.warning("Select at least one metric before submitting.")
+        else:
+            try:
+                cached = None if recompute else load_cached_baseline(settings, dataset_path)
+                if cached is not None:
+                    baseline = cached  # reuse — no backend call
+                else:
+                    bar_b = st.progress(0.0, text="Running Foundry IQ baseline...")
+                    baseline = get_or_compute_baseline(
+                        settings, dataset_path, force=recompute, limit=lim,
+                        progress=lambda d, t: bar_b.progress(d / t, text=f"Baseline {d}/{t}"),
+                    )
+                    bar_b.empty()
+                bar = st.progress(0.0, text="Running Custom evaluation...")
+                pipeline = get_pipeline(settings, "custom", **overrides)
+                custom = run_evaluation(
+                    pipeline, dataset_path, settings,
+                    metrics=tuple(metrics), limit=lim,
+                    progress=lambda d, t: bar.progress(d / t, text=f"Custom {d}/{t}"),
+                )
+                bar.empty()
+                save_report(settings, custom, f"custom_{int(custom.timestamp)}.json")
+                st.session_state["custom"] = custom.to_json()
+                st.success("Evaluation complete.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Evaluation failed: {type(exc).__name__}: {exc}")
+
+    # --- Results: render whatever has been computed (persists across reruns) ---
+    baseline = load_cached_baseline(settings, dataset_path)
+    if baseline is None:
+        st.info(
+            "Configure metrics / max questions above, then click **Submit** to run the "
+            "evaluation. Changing those inputs won't call the backend until you submit."
+        )
+        return
+
+    st.markdown("#### Default Foundry IQ baseline")
+    st.caption(f"Baseline config: `{baseline.config}`")
+    st.dataframe(_metrics_table({"Foundry IQ (baseline)": baseline}))
+
     if "custom" in st.session_state:
         custom = EvalReport.from_json(st.session_state["custom"])
         if custom.dataset_fingerprint == baseline.dataset_fingerprint:
             cmp = compare(baseline, custom)
-            st.markdown("#### Comparison")
+            st.markdown("#### Comparison — Custom RAG vs Foundry IQ")
             st.info(f"**Verdict: {cmp.verdict}**")
             table = _metrics_table({"Foundry IQ (baseline)": baseline, "Custom": custom})
             table["Δ (custom−base)"] = pd.Series(cmp.deltas)
