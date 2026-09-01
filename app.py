@@ -39,7 +39,7 @@ from src.search_index import document_count
 ROOT = Path(__file__).parent
 LABEL_TO_MODE = {v: k for k, v in MODE_LABELS.items()}
 
-st.set_page_config(page_title="SGS Document Assistant", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Document Query Assistant", page_icon="📄", layout="wide")
 
 
 @st.cache_resource(show_spinner=False)
@@ -506,7 +506,7 @@ def main() -> None:
         st.error(f"Configuration error — check your .env file.\n\n{type(exc).__name__}: {exc}")
         st.stop()
 
-    st.title("📄 SGS Document Assistant")
+    st.title("📄 Document Query Assistant")
     st.caption(
         "Ask questions about SGS policies grounded in the indexed documents, "
         "and compare a tunable Custom RAG config against the Default Foundry IQ baseline."

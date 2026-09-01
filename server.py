@@ -28,7 +28,7 @@ from src import speech
 from src.config import get_settings
 from src.pipelines import get_pipeline
 
-app = FastAPI(title="SGS Voice Stream")
+app = FastAPI(title="Document Query Assistant Voice Backend")
 settings = get_settings()
 
 _STATIC_DIR = Path(__file__).parent / "static"

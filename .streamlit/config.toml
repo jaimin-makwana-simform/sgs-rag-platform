@@ -1,0 +1,4 @@
+[server]
+# Max size (MB) for st.file_uploader uploads. Default is 200; capped at 5 MB for
+# this POC (PDF uploads + small ground-truth JSONL datasets).
+maxUploadSize = 5

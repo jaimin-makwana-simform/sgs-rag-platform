@@ -1,4 +1,4 @@
-# SGS Document Assistant — RAG Chatbot POC
+# Document Query Assistant — RAG Chatbot POC
 
 A proof-of-concept Retrieval-Augmented Generation (RAG) platform over a set of SGS
 policy / general-conditions PDFs. Users can also upload their own PDFs (stored
@@ -19,39 +19,118 @@ Both modes generate on the same guardrailed `gpt-5-1` deployment
 the Custom knobs can't bypass guardrails), share the Foundry model + agent identity,
 and feed a common evaluation pipeline. See **[Two modes + evaluation](#two-modes--evaluation)**.
 
-## Quick start
+## Quick start (end to end)
 
-Run from the project root. Prerequisites: [uv](https://docs.astral.sh/uv/getting-started/installation/),
-Azure CLI logged in (`az login`), and the Bicep extension (`az bicep install`).
+Run everything from the **project root**. This gets you from nothing to a working POC —
+chat, the Foundry IQ vs Custom RAG comparison, the evaluation harness, **and** the
+voice + talking-avatar features.
+
+**Prerequisites**
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python env/deps).
+- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli), logged in (`az login`),
+  with the Bicep extension (`az bicep install`).
+- Azure access to: **Azure AI Search** + **Azure OpenAI** (`gpt-5-1` chat + `text-embedding-3-small`).
+  For **voice + avatar** you also need an **Azure AI Speech** (or multi-service *AIServices*)
+  resource in an avatar-supported region (e.g. `eastus`). For **Default (Foundry IQ)** mode you
+  need an **Azure AI Foundry** project.
+- A **Chromium browser (Chrome or Edge)** to view the talking avatar (Firefox needs Coturn ICE).
 
 ```bash
-# 1. Provision Azure AI Search + Azure OpenAI and auto-write .env
-#    (skip if you already have a valid .env)
+# 1. Provision core infra — Azure AI Search + Azure OpenAI (gpt-5-1 + embeddings) — and
+#    auto-write .env. Deploys into an EXISTING resource group (see infra/deploy.sh).
+#    NOTE: this does NOT create the Speech or Foundry resources (configure those in step 2).
 ./infra/deploy.sh
 #    Optional overrides:
-#    SUBSCRIPTION="My Sub" RESOURCE_GROUP=sgs-rag-poc LOCATION=eastus ENV_NAME=sgs-rag ./infra/deploy.sh
+#    SUBSCRIPTION="My Sub" RESOURCE_GROUP=AI-CoE-rg LOCATION=eastus ENV_NAME=sgs-rag ./infra/deploy.sh
 
-# 2. (Only if you skipped step 1) configure by hand
-cp .env.example .env        # then edit endpoints / keys / deployment names
+# 2. Configure .env
+#    - If you skipped step 1:            cp .env.example .env   # then fill endpoints/keys
+#    - Voice + avatar (Azure Speech):    set SPEECH_REGION (avatar-supported, e.g. eastus);
+#                                        set SPEECH_API_KEY unless AZURE_OPENAI_* is a
+#                                        multi-service AIServices resource that includes Speech
+#                                        (then leave it blank to reuse AZURE_OPENAI_API_KEY).
+#    - Avatar (opt-in; bills per min):   AVATAR_ENABLED=true   (AVATAR_CHARACTER/STYLE optional)
+#    - Default / Foundry IQ mode:        FOUNDRY_PROJECT_ENDPOINT + FOUNDRY_PROJECT_NAME
 
-# 3. Create the environment from pyproject.toml + uv.lock
+# 3. Create the Python environment from pyproject.toml + uv.lock
 uv sync
 
-# 4. Ingest the 10 SGS PDFs (creates the Azure AI Search index + uploads chunks)
+# 4. Ingest the seed SGS PDFs (creates the Azure AI Search index + uploads chunks)
 uv run python ingest.py
 
-# 5. Launch the chatbot
-uv run streamlit run app.py
+# 5. (Default / Foundry IQ mode only) verify or create the Foundry agent + KB
+uv run python -m src.foundry_provision --create      # omit --create to only verify
+
+# 6. Run EVERYTHING — FastAPI voice/avatar backend (:8000) + Streamlit UI (:8501).
+#    Ctrl-C stops both. Use this instead of `streamlit run` so voice + avatar work.
+./run.sh
 ```
 
-From the app you can ask questions (grounded answers with `[file p.N]` citations),
-upload your own PDFs in the sidebar → **Save & index uploads**, and adjust `TOP_K`
-live. Re-run step 4 after changing chunking or the embedding model (if you change
-`EMBEDDING_DIMENSIONS`, drop the index first — vector dimensions are fixed at
-index creation). Teardown: `RESOURCE_GROUP=sgs-rag-poc ./infra/teardown.sh`
-(add `DELETE_GROUP=true` to remove the whole resource group).
+Open **http://localhost:8501**. You can ask questions (grounded answers with `[file p.N]`
+citations), toggle **Default (Foundry IQ) ↔ Custom RAG** in the sidebar, upload your own PDFs
+→ **Save & index uploads**, run the **Evaluate** tab, and in Custom mode pick **Voice output →
+🔊 Streaming (live)** or **🧑 Avatar**.
 
-Detailed explanations of each step are in the sections below.
+**Feature checklist** (what each one needs):
+
+| Feature | Requires |
+| --- | --- |
+| Chat / Custom RAG | steps 1–4, then `./run.sh` (or `uv run streamlit run app.py`) |
+| Default (Foundry IQ) mode | `FOUNDRY_*` in `.env` + step 5 + `az login` (RBAC) |
+| Voice (STT + TTS streaming) | Azure Speech in `.env` (`SPEECH_REGION`/`SPEECH_API_KEY`) + `./run.sh` |
+| 🧑 Agent avatar | voice prerequisites + `AVATAR_ENABLED=true` + avatar-supported `SPEECH_REGION` + Chrome/Edge |
+| Evaluation | Foundry IQ mode (baseline) + `gpt-5-1` judge (mind the 10K-TPM quota) |
+
+Re-run step 4 after changing chunking or the embedding model (if you change
+`EMBEDDING_DIMENSIONS`, drop the index first — vector dimensions are fixed at index creation).
+Uploads are capped at **5 MB** (`.streamlit/config.toml`). Teardown:
+`RESOURCE_GROUP=AI-CoE-rg ./infra/teardown.sh` (add `DELETE_GROUP=true` to remove the whole
+resource group). Detailed explanations of each step are in the sections below.
+
+## Reusing shared team resources (no provisioning)
+
+If a teammate already provisioned the Azure resources in your shared resource group, you
+**don't create anything** — reuse theirs. Skip the provisioning steps and just wire up locally.
+
+**Skip these** (already exist, shared):
+- `./infra/deploy.sh` — the Search service, Azure OpenAI (`gpt-5-1` + embeddings), Speech, and
+  Foundry project already exist.
+- `python -m src.foundry_provision --create` — the `sgs-policy-assistant` agent + KB already
+  exist (at most run it *without* `--create` to verify).
+- `uv run python ingest.py` — the Azure AI Search index (`sgs-docs`) is **shared**; if the seed
+  PDFs are already ingested, the chunks are there. Ingest only needs to run **once, by anyone**.
+
+**Do these locally:**
+```bash
+# 1. Get the .env — it's gitignored, so it is NOT in the repo. Ask the owner to share it
+#    securely (it contains keys), or copy .env.example and fill in the shared endpoints/keys.
+cp .env.example .env        # then paste the shared values
+
+# 2. Python env
+uv sync
+
+# 3. Only if you use Default (Foundry IQ) mode or RBAC-auth Search: sign in.
+#    Your identity also needs the role assignments (e.g. "Search Index Data Reader" and
+#    access to the Foundry project). Key-based resources (chat, Speech) need no login.
+az login
+
+# 4. For the avatar: set AVATAR_ENABLED=true in .env (Chrome/Edge required).
+
+# 5. Run everything
+./run.sh
+```
+
+**Auth, at a glance** (this setup): chat = API key (works for anyone with the key), **Search =
+RBAC**, **Foundry agent = RBAC** (both need `az login` + a role assignment on *your* identity),
+Speech = API key. So a teammate who only wants **Custom RAG + voice + avatar** (all key-based)
+may not need `az login` at all; **Default (Foundry IQ) mode** does.
+
+**Shared-resource cautions:**
+- **`gpt-5-1` is a shared 10K-TPM deployment** — several people running chat/voice/eval at once
+  will hit 429s much sooner. Keep eval **Max questions** low.
+- **The `sgs-docs` index is shared** — sidebar uploads (**Save & index uploads**) and especially
+  **changing Custom chunk size / overlap** rebuild the shared index, affecting *everyone*. Don't
+  change chunking on a shared index unless the team agrees.
 
 ## How it works
 
@@ -217,6 +296,7 @@ app.py               Streamlit UI (mode toggle, Ask + Evaluate tabs, upload, re-
 server.py            FastAPI backend: "Streaming (live)" voice + avatar page/token endpoints
 static/avatar/       agent-avatar client (WebRTC + Azure real-time TTS Avatar SDK)
 run.sh               launcher: starts the voice backend + Streamlit together
+.streamlit/config.toml  Streamlit config (upload limit capped at 5 MB)
 ingest.py            CLI to ingest the seed PDFs
 src/
   speech.py          Azure Speech STT + TTS wrapper (transcribe, synthesize, sentences)
@@ -270,7 +350,7 @@ infra/
   main.bicep            orchestrates the two modules; emits endpoints as outputs
   main.parameters.json  default environmentName / location
   modules/
-    openai.bicep        Azure OpenAI account + gpt-4o-mini + text-embedding-3-small
+    openai.bicep        Azure OpenAI account (kind=OpenAI) + gpt-5-1 + text-embedding-3-small
     search.bicep        Azure AI Search (basic; vector + hybrid; AAD-or-key auth)
   deploy.sh             validate → what-if → deploy → write .env
   teardown.sh           delete the resources (or the whole RG with DELETE_GROUP=true)
@@ -278,12 +358,19 @@ infra/
 
 Model/SKU/capacity/tier are all Bicep parameters (see the top of `main.bicep`).
 
+> **Not provisioned by Bicep:** Azure **Speech** (for voice/avatar) and the Azure **AI
+> Foundry** project/agent (for Default mode). The OpenAI resource is `kind=OpenAI`, so its
+> key does **not** cover Speech — set `SPEECH_REGION`/`SPEECH_API_KEY` in `.env` for a Speech
+> (or multi-service *AIServices*) resource, and provision the Foundry agent with
+> `python -m src.foundry_provision --create`.
+
 ### Option B — Azure portal
 
-Prefer clicking through the portal? See the step-by-step in the project chat notes,
-or create an **Azure AI Search** service (Basic) + an **Azure OpenAI** resource with
-`text-embedding-3-small` and `gpt-4o-mini` deployments, then fill `.env` manually
-(next step). The app auto-creates the `sgs-docs` index on first ingest.
+Prefer clicking through the portal? Create an **Azure AI Search** service (Basic) + an
+**Azure OpenAI** resource with `text-embedding-3-small` and `gpt-5-1` deployments, then fill
+`.env` manually (next step). For voice/avatar also create an **Azure AI Speech** (or
+multi-service *AIServices*) resource in an avatar-supported region and set `SPEECH_*`. The app
+auto-creates the `sgs-docs` index on first ingest.
 
 ## 2. Configure
 
@@ -317,17 +404,35 @@ uv run python ingest.py
 
 You should see the index get created and a count of uploaded chunks.
 
-## 5. Run the app
+## 5. (Default / Foundry IQ mode) provision the Foundry agent
+
+Only needed for the **Default (Foundry IQ)** mode and its evaluation baseline. On the shared
+dev3 project the agent + KB already exist, so this just verifies them; `--create` makes them
+idempotently on a fresh project (then grant the agent identity the "Search Index Data Reader"
+role — see `src/foundry_provision.py`). Requires `az login` (RBAC).
 
 ```bash
-uv run streamlit run app.py
+uv run python -m src.foundry_provision --create   # omit --create to only verify
 ```
 
-Then:
+## 6. Run the app
+
+Use the launcher so the **voice backend + avatar** work (it starts FastAPI on `:8000` and
+Streamlit on `:8501`, and stops both on Ctrl-C):
+
+```bash
+./run.sh
+```
+
+Chat-only (no voice/avatar) can run Streamlit alone: `uv run streamlit run app.py`.
+
+Then, at **http://localhost:8501**:
 - Ask a question, e.g. *"What does the SGS anti-corruption policy prohibit?"* —
   you'll get an answer with `[file p.N]` citations and expandable source chunks.
-- Upload a PDF in the sidebar → **Save & index uploads** → ask about it. Its
-  sources will be tagged `custom`.
+- Toggle **Default (Foundry IQ) ↔ Custom RAG** in the sidebar.
+- Upload a PDF in the sidebar → **Save & index uploads** → ask about it (sources tagged `custom`).
+- In **Custom** mode, set **Voice output → 🔊 Streaming (live)** or **🧑 Avatar** (see
+  [Voice](#voice-speak-your-question-hear-the-answer) / [Agent avatar](#agent-avatar-azure-real-time-tts-avatar)).
 
 ## Tuning
 
